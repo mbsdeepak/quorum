@@ -91,8 +91,27 @@ func main() {
 	waitCaughtUp(c, leader, "status", "failed-over")
 	printTable(c, append(keysOf(data), "status"))
 
+	// 8) Log compaction via snapshots.
+	step("Writing 120 more keys to trigger snapshots (Raft log compaction)")
+	for i := 0; i < 120; i++ {
+		if _, err := c.Put([]byte(fmt.Sprintf("bulk:%03d", i)), []byte(fmt.Sprintf("%d", i)), writeTimeout); err != nil {
+			fail(err)
+		}
+	}
+	fmt.Println("   done — 120 keys committed")
+	time.Sleep(300 * time.Millisecond)
+
+	step("Each node kept its Raft log SMALL despite ~125 total writes — snapshots compacted it")
+	fmt.Printf("   %-8s | %-12s | %-16s | %s\n", "node", "applied idx", "raft log entries", "snapshot @ idx")
+	fmt.Printf("   %-8s | %-12s | %-16s | %s\n", "--------", "------------", "----------------", "--------------")
+	for n := 0; n < c.Size(); n++ {
+		applied, logLen, snapIdx := c.Stats(n)
+		fmt.Printf("   node %-3d | %-12d | %-16d | %d\n", n, applied, logLen, snapIdx)
+	}
+
 	fmt.Println("\n✓ Demo complete: a leader was elected, writes replicated to all nodes,")
-	fmt.Println("  the cluster survived a leader failure, and the recovered node caught up.")
+	fmt.Println("  the cluster survived a leader failure, the recovered node caught up,")
+	fmt.Println("  and snapshots compacted the log while state stayed consistent.")
 }
 
 // printTable prints each key's value as seen by every node.

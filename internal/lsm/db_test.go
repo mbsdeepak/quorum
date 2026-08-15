@@ -125,6 +125,37 @@ func TestCompaction(t *testing.T) {
 	}
 }
 
+// TestItems checks full-state enumeration: sorted, newest-wins, tombstones gone,
+// across both the memtable and flushed SSTables.
+func TestItems(t *testing.T) {
+	db, _ := openTestDB(t, DefaultOptions())
+	defer db.Close()
+
+	must(t, db.Put([]byte("b"), []byte("1")))
+	must(t, db.Put([]byte("a"), []byte("1")))
+	must(t, db.Flush()) // push into an SSTable
+	must(t, db.Put([]byte("a"), []byte("2"))) // newer value shadows the flushed one
+	must(t, db.Put([]byte("c"), []byte("1")))
+	must(t, db.Delete([]byte("b"))) // tombstone must be excluded
+
+	items, err := db.Items()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	var keys []string
+	for _, kv := range items {
+		got[string(kv.Key)] = string(kv.Value)
+		keys = append(keys, string(kv.Key))
+	}
+	if len(items) != 2 || got["a"] != "2" || got["c"] != "1" {
+		t.Fatalf("items = %v, want a=2 c=1", got)
+	}
+	if keys[0] != "a" || keys[1] != "c" {
+		t.Fatalf("items not sorted: %v", keys)
+	}
+}
+
 // TestReopenAfterCompaction ensures persisted SSTables reload correctly.
 func TestReopenAfterCompaction(t *testing.T) {
 	dir := t.TempDir()

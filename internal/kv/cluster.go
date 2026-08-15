@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mbsdeepak/quorum/internal/lsm"
 	"github.com/mbsdeepak/quorum/internal/raft"
 )
 
@@ -14,7 +13,6 @@ import (
 type Cluster struct {
 	Net    *raft.InMemNetwork
 	Stores []*Store
-	dbs    []*lsm.DB
 	down   []bool // nodes we've crashed/partitioned; a partitioned leader still
 	// self-reports as leader until it can reach peers, so leader queries skip them
 }
@@ -29,14 +27,12 @@ func NewInMemCluster(dirs []string) (*Cluster, error) {
 	}
 	c := &Cluster{Net: raft.NewInMemNetwork(), down: make([]bool, n)}
 	for i := 0; i < n; i++ {
-		db, err := lsm.Open(dirs[i], lsm.DefaultOptions())
+		s, err := NewStore(i, peers, c.Net.Transport(i), raft.NewMemoryPersister(), dirs[i])
 		if err != nil {
 			c.Close()
-			return nil, fmt.Errorf("open lsm %d: %w", i, err)
+			return nil, fmt.Errorf("start store %d: %w", i, err)
 		}
-		s := NewStore(i, peers, c.Net.Transport(i), raft.NewMemoryPersister(), db)
 		c.Net.Register(i, s.rf) // let peers reach this node's RPC handler
-		c.dbs = append(c.dbs, db)
 		c.Stores = append(c.Stores, s)
 	}
 	return c, nil
@@ -99,11 +95,18 @@ func (c *Cluster) mutate(op func(*Store) error, key []byte, timeout time.Duratio
 // ReadFrom reads key from a specific node's local LSM store, reflecting whatever
 // that replica has applied so far.
 func (c *Cluster) ReadFrom(node int, key []byte) (string, bool) {
-	v, err := c.dbs[node].Get(key)
+	v, err := c.Stores[node].Get(key)
 	if err != nil {
 		return "", false
 	}
 	return string(v), true
+}
+
+// Stats returns a node's applied index, live Raft log length, and snapshot index
+// — enough to observe log compaction in action.
+func (c *Cluster) Stats(node int) (applied, logLen, snapIndex int) {
+	s := c.Stores[node]
+	return s.AppliedIndex(), s.RaftLogLength(), s.SnapshotIndex()
 }
 
 // SetDown isolates or restores a node (crash / partition simulation).
@@ -116,8 +119,5 @@ func (c *Cluster) SetDown(node int, down bool) {
 func (c *Cluster) Close() {
 	for _, s := range c.Stores {
 		s.Close()
-	}
-	for _, db := range c.dbs {
-		db.Close()
 	}
 }

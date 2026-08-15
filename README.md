@@ -4,11 +4,15 @@ A distributed key-value database built from scratch in Go — a **log-structured
 
 Built the way the real ones are (the lineage behind Bigtable, RocksDB, Cassandra, CockroachDB, etcd) and small enough to read end to end.
 
-> **Status — Phase 2 in progress: Raft-replicated across a cluster.**
-> The single-node LSM engine (Phase 1) and Raft consensus — leader election, log
-> replication, crash-safe persistence — are implemented and tested (race-clean). A
-> 3-node cluster replicates writes to three independent LSM stores that converge.
-> Snapshots, a networked transport, and sharding are next; see the roadmap.
+> **Status — Phase 2.5: Raft with log compaction (snapshots).**
+> The LSM engine (Phase 1), Raft consensus (Phase 2), and now **snapshot-based
+> log compaction** are implemented and tested (race-clean). A 3-node cluster
+> replicates writes to three independent LSM stores that converge, survives leader
+> failure, compacts its log via snapshots, and catches up a far-behind follower
+> with `InstallSnapshot`. Dynamic membership changes, a networked transport, and
+> sharding are next; see the roadmap.
+>
+> Run the walkthrough: `go run ./cmd/quorum-demo`
 
 ---
 
@@ -110,6 +114,28 @@ A design note worth knowing: the leader only commits an entry from its **current
 
 ---
 
+## Phase 2.5 — snapshots & log compaction (done)
+
+Left alone, the Raft log grows forever. Snapshots fix that: the application periodically serializes its state up to some index and hands it to Raft, which then **discards the covered log prefix**. And when a follower has fallen so far behind that the leader has already compacted the entries it needs, the leader ships the whole **snapshot** instead of replaying the log.
+
+```
+before compaction                     after Snapshot(100)
+  log: [1][2][3]...[100][101][102]      snapshot ≡ state@100
+        └──── 102 entries ────┘         log: (100)[101][102]     ← 2 entries kept
+                                              ▲ sentinel = boundary
+```
+
+- **`Snapshot(index, data)`** — application-driven compaction. The index math is rebased so absolute index → `i - lastIncludedIndex` (all routed through `*Locked` helpers to keep it in one place).
+- **`InstallSnapshot` RPC** — a leader catches up a follower whose needed prefix is gone. The follower's applier delivers the snapshot to the state machine, which **rebuilds** from it (the kv `Store` wipes and reloads its LSM engine).
+- **Boot from snapshot** — on restart a node restores `lastIncluded{Index,Term}` + snapshot, replays only the log tail, and re-delivers the snapshot so a volatile state machine can rebuild.
+- **LSM `Items()`** — full-state enumeration (sorted, newest-wins, tombstones dropped) is what serializes the state machine for a snapshot.
+
+Tested race-clean: the log provably shrinks under load, a partitioned follower is caught up via `InstallSnapshot`, and a rebooted node rebuilds from snapshot + tail. The demo's final section shows ~125 writes leaving only ~25 live log entries per node (`snapshot @ 100`).
+
+A subtlety handled in the applier: the boot-from-snapshot delivery guard is `>=` (not `>`), because a freshly booted node's `lastApplied` already equals the snapshot index — a strict `>` would silently drop the snapshot and leave a volatile state machine empty.
+
+---
+
 ## Try it
 
 ```bash
@@ -131,7 +157,8 @@ Kill the process before `flush` and reopen — the data comes back from the WAL.
 
 - [x] **Phase 1 — LSM storage engine**: WAL, skiplist memtable, SSTables with bloom filters + sparse index, full compaction, crash recovery.
 - [x] **Phase 2 — Raft consensus**: leader election, log replication with fast-backup, crash-safe persistence, and the replicated log driving each node's LSM engine so a majority — a *quorum* — agrees on every write.
-- [ ] **Phase 2.5 — Raft completeness**: log compaction via **snapshots** (`InstallSnapshot`), and dynamic **membership changes**.
+- [x] **Phase 2.5a — snapshots**: log compaction via `Snapshot` + `InstallSnapshot`, boot-from-snapshot recovery, and LSM full-state enumeration (`Items`).
+- [ ] **Phase 2.5b — membership changes**: add/remove nodes at runtime via single-server config entries.
 - [ ] **Phase 3 — distributed layer**: a real **networked transport** (replace the in-memory one), **linearizable reads** (read-index / leader lease), then **sharding** (range or hash partitions) with per-shard Raft groups to scale horizontally.
 - [ ] **Engine polish**: block compression, an ordered range/scan iterator, leveled compaction with correct tombstone lifetime.
 

@@ -185,6 +185,50 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return nil, ErrNotFound
 }
 
+// KV is a single key/value pair returned by Items.
+type KV struct {
+	Key   []byte
+	Value []byte
+}
+
+// Items returns every live key/value pair in sorted key order, applying the
+// same newest-first shadowing as reads (memtable over SSTables, newest SSTable
+// first) and skipping tombstones. It materializes the whole dataset, so it is
+// meant for bounded stores and full-state operations — e.g. serializing the
+// state machine for a Raft snapshot — not hot-path scans.
+func (db *DB) Items() ([]KV, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	seen := make(map[string]struct{})
+	var out []KV
+	add := func(e entry) {
+		if _, ok := seen[string(e.key)]; ok {
+			return
+		}
+		seen[string(e.key)] = struct{}{}
+		if e.kind == kindDelete {
+			return
+		}
+		out = append(out, KV{Key: append([]byte(nil), e.key...), Value: append([]byte(nil), e.val...)})
+	}
+
+	for _, e := range db.mem.scan() { // memtable is newest
+		add(e)
+	}
+	for _, r := range db.ssts { // then SSTables, newest first
+		es, err := r.all()
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range es {
+			add(e)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Key, out[j].Key) < 0 })
+	return out, nil
+}
+
 // Flush forces the active memtable to disk. Useful for clean shutdown and tests.
 func (db *DB) Flush() error {
 	db.mu.Lock()

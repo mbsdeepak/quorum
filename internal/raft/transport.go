@@ -9,12 +9,14 @@ import "sync"
 type Transport interface {
 	SendRequestVote(peer int, args *RequestVoteArgs, reply *RequestVoteReply) bool
 	SendAppendEntries(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool
+	SendInstallSnapshot(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool
 }
 
 // rpcHandler is the receiving side a node registers with the network.
 type rpcHandler interface {
 	HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
+	HandleInstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply)
 }
 
 // InMemNetwork routes RPCs between in-process Raft nodes and can drop traffic to
@@ -87,5 +89,14 @@ func (t *inMemTransport) SendAppendEntries(peer int, args *AppendEntriesArgs, re
 		return false
 	}
 	h.HandleAppendEntries(args, reply)
+	return true
+}
+
+func (t *inMemTransport) SendInstallSnapshot(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	h, ok := t.net.reachable(t.from, peer)
+	if !ok {
+		return false
+	}
+	h.HandleInstallSnapshot(args, reply)
 	return true
 }

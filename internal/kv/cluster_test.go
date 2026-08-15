@@ -16,7 +16,6 @@ type kvCluster struct {
 	n      int
 	net    *raft.InMemNetwork
 	stores []*Store
-	dbs    []*lsm.DB
 }
 
 func makeKVCluster(t *testing.T, n int) *kvCluster {
@@ -26,12 +25,10 @@ func makeKVCluster(t *testing.T, n int) *kvCluster {
 		peers[i] = i
 	}
 	for i := 0; i < n; i++ {
-		db, err := lsm.Open(t.TempDir(), lsm.DefaultOptions())
+		s, err := NewStore(i, peers, c.net.Transport(i), raft.NewMemoryPersister(), t.TempDir())
 		if err != nil {
-			t.Fatalf("open lsm %d: %v", i, err)
+			t.Fatalf("start store %d: %v", i, err)
 		}
-		c.dbs = append(c.dbs, db)
-		s := NewStore(i, peers, c.net.Transport(i), raft.NewMemoryPersister(), db)
 		c.stores = append(c.stores, s)
 		// Register the node's RPC handler so peers can reach it. (With a real
 		// TCP transport this is the node binding its listen socket.)
@@ -43,7 +40,6 @@ func makeKVCluster(t *testing.T, n int) *kvCluster {
 func (c *kvCluster) cleanup() {
 	for i := 0; i < c.n; i++ {
 		c.stores[i].Close()
-		c.dbs[i].Close()
 	}
 }
 
@@ -82,7 +78,7 @@ func (c *kvCluster) getEventually(node int, key, want []byte, wantMissing bool) 
 	var lastErr error
 	var lastVal []byte
 	for time.Now().Before(deadline) {
-		v, err := c.dbs[node].Get(key)
+		v, err := c.stores[node].Get(key)
 		lastErr, lastVal = err, v
 		if wantMissing {
 			if err == lsm.ErrNotFound {
@@ -126,6 +122,59 @@ func TestReplicatedDelete(t *testing.T) {
 	c.del([]byte("k"))
 	for node := 0; node < c.n; node++ {
 		c.getEventually(node, []byte("k"), nil, true)
+	}
+}
+
+func (c *kvCluster) findLeader() int {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for i := 0; i < c.n; i++ {
+			if c.stores[i].IsLeader() {
+				return i
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	c.t.Fatal("no leader")
+	return -1
+}
+
+// TestSnapshotCatchUp is the full-system snapshot scenario: a follower is
+// partitioned, the cluster writes far past the snapshot threshold so the leader
+// compacts the log the follower would need, and on rejoin the follower must
+// rebuild its LSM from an InstallSnapshot rather than the (gone) log entries.
+func TestSnapshotCatchUp(t *testing.T) {
+	c := makeKVCluster(t, 3)
+	defer c.cleanup()
+
+	leader := c.findLeader()
+	follower := (leader + 1) % 3
+	c.net.SetDown(follower, true) // partition one follower away
+
+	// Well past snapshotEvery (50) so the leader compacts beyond the follower.
+	const N = 130
+	for i := 0; i < N; i++ {
+		c.put([]byte(fmt.Sprintf("key-%03d", i)), []byte(fmt.Sprintf("val-%d", i)))
+	}
+
+	// A surviving node must have compacted its log via a snapshot.
+	compacted := false
+	for i := 0; i < c.n; i++ {
+		if i != follower && c.stores[i].rf.SnapshotIndex() > 0 {
+			compacted = true
+		}
+	}
+	if !compacted {
+		t.Fatal("no node compacted its log; snapshot path not exercised")
+	}
+
+	c.net.SetDown(follower, false) // rejoin — must catch up via snapshot
+
+	// The follower's LSM was rebuilt from the snapshot: earliest and latest keys.
+	c.getEventually(follower, []byte("key-000"), []byte("val-0"), false)
+	c.getEventually(follower, []byte(fmt.Sprintf("key-%03d", N-1)), []byte(fmt.Sprintf("val-%d", N-1)), false)
+	if c.stores[follower].rf.SnapshotIndex() == 0 {
+		t.Fatal("follower did not receive a snapshot")
 	}
 }
 

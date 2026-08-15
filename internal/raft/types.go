@@ -29,13 +29,20 @@ type LogEntry struct {
 	Command []byte
 }
 
-// ApplyMsg is handed to the application each time an entry is committed, i.e.
-// safely replicated on a majority. The application applies Command to its state
-// machine (here, the LSM store) in CommandIndex order.
+// ApplyMsg carries either a committed command or an installed snapshot up to the
+// application. Exactly one of CommandValid / SnapshotValid is true. Commands
+// arrive in CommandIndex order; a snapshot means "discard your state and reset
+// to this point" (used when a follower was too far behind to catch up via the
+// log, because the leader had already compacted the entries it needed).
 type ApplyMsg struct {
 	CommandValid bool
 	Command      []byte
 	CommandIndex int
+
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotTerm  int
+	SnapshotIndex int
 }
 
 // RequestVoteArgs / RequestVoteReply — the RPC a candidate uses to gather votes
@@ -70,4 +77,20 @@ type AppendEntriesReply struct {
 	Success       bool
 	ConflictTerm  int
 	ConflictIndex int
+}
+
+// InstallSnapshotArgs / InstallSnapshotReply — a leader ships its snapshot to a
+// follower whose needed log prefix has already been compacted away (Raft §7).
+// This implementation sends the snapshot in a single message rather than in
+// chunks; chunking is a straightforward extension.
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
 }
