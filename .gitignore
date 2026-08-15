@@ -1,0 +1,19 @@
+# Build output
+/quorum
+/bin/
+
+# Local engine data dirs
+/data/
+quorum-data/
+*.dat
+wal.log
+
+# Go
+*.test
+*.out
+coverage.*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
