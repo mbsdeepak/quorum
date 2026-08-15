@@ -38,10 +38,13 @@ const (
 // Raft is one node in the cluster. It is safe for concurrent use; almost all
 // state is guarded by mu.
 type Raft struct {
-	mu        sync.Mutex
-	id        int
-	peers     []int
-	trans     Transport
+	mu    sync.Mutex
+	id    int
+	peers []int // CURRENT cluster config (voting members); derived from the log
+	// baseConfig is the config as of the snapshot boundary — the fallback when
+	// the live log holds no configuration entry.
+	baseConfig []int
+	trans      Transport
 	persister Persister
 	applyCh   chan ApplyMsg
 	applyCond *sync.Cond
@@ -80,6 +83,7 @@ func Make(id int, peers []int, trans Transport, persister Persister, applyCh cha
 	rf := &Raft{
 		id:         id,
 		peers:      append([]int(nil), peers...),
+		baseConfig: append([]int(nil), peers...),
 		trans:      trans,
 		persister:  persister,
 		applyCh:    applyCh,
@@ -99,8 +103,12 @@ func Make(id int, peers []int, trans Transport, persister Persister, applyCh cha
 			rf.log = s.Log
 			rf.lastIncludedIndex = s.LastIncludedIndex
 			rf.lastIncludedTerm = s.LastIncludedTerm
+			if s.BaseConfig != nil {
+				rf.baseConfig = s.BaseConfig
+			}
 		}
 	}
+	rf.refreshConfigLocked() // derive the live config from the restored log
 	if snap, err := persister.LoadSnapshot(); err == nil && len(snap) > 0 {
 		rf.snapshot = snap
 	}
@@ -151,14 +159,44 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 	off := index - rf.lastIncludedIndex
 	rf.lastIncludedTerm = rf.log[off].Term
+	newBase := rf.configAsOfLocked(index) // fold the config at the boundary into baseConfig
 	// Rebuild the log as: sentinel(index) + entries after index.
 	newLog := make([]LogEntry, 1, len(rf.log)-off)
 	newLog[0] = LogEntry{Term: rf.lastIncludedTerm}
 	newLog = append(newLog, rf.log[off+1:]...)
 	rf.log = newLog
 	rf.lastIncludedIndex = index
+	rf.baseConfig = append([]int(nil), newBase...)
 	rf.snapshot = append([]byte(nil), snapshot...)
+	rf.refreshConfigLocked()
 	rf.persistStateAndSnapshotLocked()
+}
+
+// ChangeConfig proposes a new cluster configuration (single-server add or remove
+// — change membership by at most one node at a time). Leader-only, and rejected
+// while a previous configuration change is still uncommitted, so at most one
+// change is ever in flight (Raft dissertation §4.1). The new config takes effect
+// on every node the moment it appends the entry, not when it commits.
+func (rf *Raft) ChangeConfig(newConfig []int) (index int, ok bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != Leader || rf.pendingConfigLocked() {
+		return -1, false
+	}
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Config: append([]int(nil), newConfig...)})
+	rf.refreshConfigLocked()
+	rf.persistLocked()
+	index = rf.lastIndexLocked()
+	rf.matchIndex[rf.id] = index
+	go rf.broadcastAppendEntries()
+	return index, true
+}
+
+// Config returns the node's current view of the cluster membership.
+func (rf *Raft) Config() []int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return append([]int(nil), rf.peers...)
 }
 
 // Status reports the node's term, whether it is leader, and its applied index.
@@ -199,7 +237,10 @@ func (rf *Raft) ticker() {
 	for !rf.killed() {
 		time.Sleep(tickInterval)
 		rf.mu.Lock()
-		if rf.role != Leader && time.Since(rf.lastHeard) >= rf.electionTimeout {
+		// A node not in the current config (e.g. a fresh learner catching up, or
+		// one that has been removed) must never start an election — it would only
+		// disrupt the cluster and can never win a majority.
+		if rf.role != Leader && rf.isMemberLocked(rf.id) && time.Since(rf.lastHeard) >= rf.electionTimeout {
 			rf.startElectionLocked()
 		}
 		rf.mu.Unlock()
@@ -326,7 +367,10 @@ func (rf *Raft) broadcastAppendEntries() {
 		return
 	}
 	term := rf.currentTerm
-	for _, peer := range rf.peers {
+	// Replicate to every tracked server, not just current voters: a server being
+	// removed stays in matchIndex until the removal commits, so it keeps getting
+	// the entries that tell it it has been removed (and thus stops campaigning).
+	for peer := range rf.matchIndex {
 		if peer == rf.id {
 			continue
 		}
@@ -335,11 +379,12 @@ func (rf *Raft) broadcastAppendEntries() {
 			// The entries this follower needs are already compacted away; ship
 			// the snapshot instead of log entries.
 			args := &InstallSnapshotArgs{
-				Term:              term,
-				LeaderID:          rf.id,
-				LastIncludedIndex: rf.lastIncludedIndex,
-				LastIncludedTerm:  rf.lastIncludedTerm,
-				Data:              append([]byte(nil), rf.snapshot...),
+				Term:               term,
+				LeaderID:           rf.id,
+				LastIncludedIndex:  rf.lastIncludedIndex,
+				LastIncludedTerm:   rf.lastIncludedTerm,
+				LastIncludedConfig: append([]int(nil), rf.baseConfig...),
+				Data:               append([]byte(nil), rf.snapshot...),
 			}
 			go rf.sendInstallSnapshotTo(peer, args, term)
 			continue
@@ -484,6 +529,7 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		rf.log = append(rf.log, args.Entries[i:]...)
 		break
 	}
+	rf.refreshConfigLocked() // appended/truncated entries may change membership
 	reply.Success = true
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -527,10 +573,14 @@ func (rf *Raft) HandleInstallSnapshot(args *InstallSnapshotArgs, reply *InstallS
 	}
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
+	if args.LastIncludedConfig != nil {
+		rf.baseConfig = append([]int(nil), args.LastIncludedConfig...)
+	}
 	rf.snapshot = append([]byte(nil), args.Data...)
 	if rf.commitIndex < args.LastIncludedIndex {
 		rf.commitIndex = args.LastIncludedIndex
 	}
+	rf.refreshConfigLocked()
 	rf.persistStateAndSnapshotLocked()
 
 	// Queue the snapshot for the applier to deliver to the state machine.
@@ -600,9 +650,14 @@ func (rf *Raft) applier() {
 			if rf.lastApplied <= rf.lastIncludedIndex {
 				continue // covered by a snapshot; skip
 			}
+			e := rf.log[rf.lastApplied-rf.lastIncludedIndex]
+			if e.Config != nil {
+				rf.applyConfigCommitLocked(e.Config)
+				continue // membership entries aren't client commands
+			}
 			batch = append(batch, ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[rf.lastApplied-rf.lastIncludedIndex].Command,
+				Command:      e.Command,
 				CommandIndex: rf.lastApplied,
 			})
 		}
@@ -615,6 +670,72 @@ func (rf *Raft) applier() {
 }
 
 // ---- helpers --------------------------------------------------------------
+
+// ---- membership helpers ---------------------------------------------------
+
+// currentConfigLocked derives the live cluster config: the newest config entry
+// in the log, or baseConfig if the log holds none.
+func (rf *Raft) currentConfigLocked() []int { return rf.configAsOfLocked(rf.lastIndexLocked()) }
+
+// configAsOfLocked returns the config in effect at absolute index upto.
+func (rf *Raft) configAsOfLocked(upto int) []int {
+	for i := upto; i > rf.lastIncludedIndex; i-- {
+		if e := rf.log[i-rf.lastIncludedIndex]; e.Config != nil {
+			return e.Config
+		}
+	}
+	return rf.baseConfig
+}
+
+// refreshConfigLocked recomputes peers from the log and makes sure leader
+// bookkeeping has an entry for every current member. Call it after any change to
+// the log or the snapshot boundary.
+func (rf *Raft) refreshConfigLocked() {
+	rf.peers = rf.currentConfigLocked()
+	for _, p := range rf.peers {
+		if _, ok := rf.nextIndex[p]; !ok {
+			rf.nextIndex[p] = rf.lastIndexLocked() + 1
+			rf.matchIndex[p] = 0
+		}
+	}
+}
+
+// applyConfigCommitLocked runs when a membership entry commits: prune bookkeeping
+// for departed servers, and step down if this leader has removed itself (Raft
+// dissertation §4.2.2 — the leader serves Cnew until it commits, then leaves).
+func (rf *Raft) applyConfigCommitLocked(config []int) {
+	for p := range rf.matchIndex {
+		if !containsInt(config, p) {
+			delete(rf.matchIndex, p)
+			delete(rf.nextIndex, p)
+		}
+	}
+	if rf.role == Leader && !containsInt(config, rf.id) {
+		rf.becomeFollowerLocked(rf.currentTerm)
+		rf.persistLocked()
+	}
+}
+
+// pendingConfigLocked reports whether an uncommitted membership entry exists.
+func (rf *Raft) pendingConfigLocked() bool {
+	for i := rf.lastIndexLocked(); i > rf.commitIndex && i > rf.lastIncludedIndex; i-- {
+		if rf.log[i-rf.lastIncludedIndex].Config != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (rf *Raft) isMemberLocked(id int) bool { return containsInt(rf.peers, id) }
+
+func containsInt(s []int, x int) bool {
+	for _, v := range s {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
 
 // lastIndexLocked is the highest absolute index present (in log or snapshot).
 func (rf *Raft) lastIndexLocked() int { return rf.lastIncludedIndex + len(rf.log) - 1 }
@@ -656,5 +777,6 @@ func (rf *Raft) stateLocked() persistentState {
 		Log:               rf.log,
 		LastIncludedIndex: rf.lastIncludedIndex,
 		LastIncludedTerm:  rf.lastIncludedTerm,
+		BaseConfig:        rf.baseConfig,
 	}
 }

@@ -27,6 +27,7 @@ type persistentState struct {
 	Log               []LogEntry
 	LastIncludedIndex int
 	LastIncludedTerm  int
+	BaseConfig        []int // cluster config as of the snapshot boundary
 }
 
 func encodeState(s persistentState) ([]byte, error) {

@@ -4,13 +4,14 @@ A distributed key-value database built from scratch in Go — a **log-structured
 
 Built the way the real ones are (the lineage behind Bigtable, RocksDB, Cassandra, CockroachDB, etcd) and small enough to read end to end.
 
-> **Status — Phase 2.5: Raft with log compaction (snapshots).**
-> The LSM engine (Phase 1), Raft consensus (Phase 2), and now **snapshot-based
-> log compaction** are implemented and tested (race-clean). A 3-node cluster
-> replicates writes to three independent LSM stores that converge, survives leader
-> failure, compacts its log via snapshots, and catches up a far-behind follower
-> with `InstallSnapshot`. Dynamic membership changes, a networked transport, and
-> sharding are next; see the roadmap.
+> **Status — Phase 2.5 complete: Raft with snapshots and membership changes.**
+> The LSM engine (Phase 1) and a full-featured Raft (Phase 2 + 2.5) are
+> implemented and tested (race-clean): leader election, log replication,
+> crash-safe persistence, **snapshot-based log compaction**, and **dynamic
+> membership changes** (add/remove a node at runtime). A 3-node cluster replicates
+> to independent LSM stores that converge, survives leader failure, compacts its
+> log, and catches a far-behind follower up via `InstallSnapshot`. A **networked
+> transport** and **sharding** are next; see the roadmap.
 >
 > Run the walkthrough: `go run ./cmd/quorum-demo`
 
@@ -136,6 +137,20 @@ A subtlety handled in the applier: the boot-from-snapshot delivery guard is `>=`
 
 ---
 
+## Phase 2.5b — membership changes (done)
+
+Clusters aren't static — machines get added and retired. quorum supports **single-server membership changes** (add or remove one node at a time — the safe variant from the Raft dissertation §4, where any two overlapping majorities guarantee safety without joint consensus).
+
+- **`ChangeConfig(newConfig)`** appends a configuration entry to the log. A node **adopts a config the moment it appends the entry** (not when it commits) — that's what makes single-server changes safe. The live config is *derived from the log* (`currentConfigLocked`), so a truncated config entry cleanly reverts.
+- **One change in flight**: a new change is rejected until the previous one commits.
+- **Leader removal**: a leader that removes itself keeps serving until `Cnew` commits, then steps down (§4.2.2).
+- **No disruption**: a node not in the current config never campaigns; the leader keeps replicating to a departing node until the removal commits so it *learns* it's gone; and new nodes join as passive **learners** (empty config → never campaign) until they catch up.
+- Config is threaded through snapshots (`baseConfig`, and `LastIncludedConfig` in `InstallSnapshot`) so it survives compaction.
+
+Tested race-clean: adding a 4th node that catches up and participates, removing a follower, and removing the leader (the rest elect a new one and keep committing).
+
+---
+
 ## Try it
 
 ```bash
@@ -158,7 +173,7 @@ Kill the process before `flush` and reopen — the data comes back from the WAL.
 - [x] **Phase 1 — LSM storage engine**: WAL, skiplist memtable, SSTables with bloom filters + sparse index, full compaction, crash recovery.
 - [x] **Phase 2 — Raft consensus**: leader election, log replication with fast-backup, crash-safe persistence, and the replicated log driving each node's LSM engine so a majority — a *quorum* — agrees on every write.
 - [x] **Phase 2.5a — snapshots**: log compaction via `Snapshot` + `InstallSnapshot`, boot-from-snapshot recovery, and LSM full-state enumeration (`Items`).
-- [ ] **Phase 2.5b — membership changes**: add/remove nodes at runtime via single-server config entries.
+- [x] **Phase 2.5b — membership changes**: add/remove a node at runtime via single-server config entries (adopt-on-append, learner catch-up, leader step-down on self-removal).
 - [ ] **Phase 3 — distributed layer**: a real **networked transport** (replace the in-memory one), **linearizable reads** (read-index / leader lease), then **sharding** (range or hash partitions) with per-shard Raft groups to scale horizontally.
 - [ ] **Engine polish**: block compression, an ordered range/scan iterator, leveled compaction with correct tombstone lifetime.
 

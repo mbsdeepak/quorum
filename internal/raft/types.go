@@ -22,11 +22,15 @@ func (r Role) String() string {
 	}
 }
 
-// LogEntry is one replicated command tagged with the term it was created in.
-// The term is what lets nodes detect and resolve divergent histories.
+// LogEntry is one replicated entry tagged with the term it was created in (the
+// term is what lets nodes detect and resolve divergent histories). Most entries
+// carry a client Command; a membership-change entry instead carries Config, the
+// new set of node ids. A node adopts a Config entry as soon as it appends it —
+// not when it commits — which is what makes single-server changes safe.
 type LogEntry struct {
 	Term    int
 	Command []byte
+	Config  []int // non-nil ⇒ this is a configuration-change entry
 }
 
 // ApplyMsg carries either a committed command or an installed snapshot up to the
@@ -84,11 +88,12 @@ type AppendEntriesReply struct {
 // This implementation sends the snapshot in a single message rather than in
 // chunks; chunking is a straightforward extension.
 type InstallSnapshotArgs struct {
-	Term              int
-	LeaderID          int
-	LastIncludedIndex int
-	LastIncludedTerm  int
-	Data              []byte
+	Term               int
+	LeaderID           int
+	LastIncludedIndex  int
+	LastIncludedTerm   int
+	LastIncludedConfig []int // cluster config as of the snapshot boundary
+	Data               []byte
 }
 
 type InstallSnapshotReply struct {
