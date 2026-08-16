@@ -183,6 +183,10 @@ func (s *Store) IsLeader() bool {
 	return isLeader
 }
 
+// Raft exposes the underlying consensus node so a transport layer can serve its
+// RPC handlers (e.g. the TCP server in package netrpc).
+func (s *Store) Raft() *raft.Raft { return s.rf }
+
 // AppliedIndex is the highest log index applied to the local store.
 func (s *Store) AppliedIndex() int {
 	s.mu.Lock()

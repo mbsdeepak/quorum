@@ -4,16 +4,15 @@ A distributed key-value database built from scratch in Go — a **log-structured
 
 Built the way the real ones are (the lineage behind Bigtable, RocksDB, Cassandra, CockroachDB, etcd) and small enough to read end to end.
 
-> **Status — Phase 2.5 complete: Raft with snapshots and membership changes.**
-> The LSM engine (Phase 1) and a full-featured Raft (Phase 2 + 2.5) are
-> implemented and tested (race-clean): leader election, log replication,
-> crash-safe persistence, **snapshot-based log compaction**, and **dynamic
-> membership changes** (add/remove a node at runtime). A 3-node cluster replicates
-> to independent LSM stores that converge, survives leader failure, compacts its
-> log, and catches a far-behind follower up via `InstallSnapshot`. A **networked
-> transport** and **sharding** are next; see the roadmap.
+> **Status — Phase 3a: runs as a real networked cluster.**
+> The LSM engine (Phase 1), a full-featured Raft (Phase 2 + 2.5: election,
+> replication, persistence, snapshots, membership changes), and now a **real TCP
+> transport** are implemented and tested. Nodes run as **separate processes**
+> talking over sockets, with an HTTP API for clients. Linearizable reads and
+> **sharding** are next; see the roadmap.
 >
-> Run the walkthrough: `go run ./cmd/quorum-demo`
+> In-process walkthrough: `go run ./cmd/quorum-demo`
+> Real cluster: see [Run a real cluster](#-run-a-real-cluster).
 
 ---
 
@@ -151,10 +150,36 @@ Tested race-clean: adding a 4th node that catches up and participates, removing 
 
 ---
 
+## Phase 3a — networked transport (done)
+
+Until now the "cluster" was goroutines sharing an in-memory transport. Phase 3a makes it real: nodes are **separate processes** that reach each other over TCP.
+
+- **`internal/netrpc`** — a `raft.Transport` over Go's `net/rpc` (gob on TCP): a per-node RPC server for `RequestVote` / `AppendEntries` / `InstallSnapshot`, and a pooled, lazily-dialed client that reports unreachable peers as failed RPCs (exactly the semantics Raft expects). The consensus core didn't change — only the wire beneath the `Transport` interface.
+- **`cmd/quorum-server`** — one node as a process: Raft over TCP to its peers plus a small **HTTP API** for clients (`PUT`/`GET`/`DELETE /kv/<key>`). Writes to a follower return `421` so the client retries the leader.
+
+Tested over real loopback sockets: replication across three processes, and leader failover (kill the leader, survivors elect a new one and keep serving).
+
+### Run a real cluster
+
+```bash
+go build -o quorum-server ./cmd/quorum-server
+peers="0=127.0.0.1:9000,1=127.0.0.1:9001,2=127.0.0.1:9002"
+./quorum-server -id 0 -raft 127.0.0.1:9000 -http 127.0.0.1:8000 -peers "$peers" -dir /tmp/q0 &
+./quorum-server -id 1 -raft 127.0.0.1:9001 -http 127.0.0.1:8001 -peers "$peers" -dir /tmp/q1 &
+./quorum-server -id 2 -raft 127.0.0.1:9002 -http 127.0.0.1:8002 -peers "$peers" -dir /tmp/q2 &
+
+curl 127.0.0.1:8000/status            # find the leader
+curl -X PUT 127.0.0.1:8000/kv/hello -d world
+curl    127.0.0.1:8001/kv/hello       # -> world (replicated to every node)
+```
+
+---
+
 ## Try it
 
 ```bash
-go test -race ./...      # LSM engine + Raft election/replication + replicated KV
+go test ./...            # LSM engine + Raft (election/replication/snapshots/membership) + networked KV
+go run ./cmd/quorum-demo # narrated in-process 3-node walkthrough
 go run ./cmd/quorum ./data
 > put user:1 deepak
 > get user:1
@@ -166,6 +191,8 @@ deepak
 
 Kill the process before `flush` and reopen — the data comes back from the WAL.
 
+> **macOS note:** on some macOS + Go 1.22 setups the race detector's external linker trips a `missing LC_UUID` dyld error for packages importing `net`. Run those with `CGO_ENABLED=0` (pure-Go net stack); the other packages race-test normally.
+
 ---
 
 ## Roadmap
@@ -174,7 +201,9 @@ Kill the process before `flush` and reopen — the data comes back from the WAL.
 - [x] **Phase 2 — Raft consensus**: leader election, log replication with fast-backup, crash-safe persistence, and the replicated log driving each node's LSM engine so a majority — a *quorum* — agrees on every write.
 - [x] **Phase 2.5a — snapshots**: log compaction via `Snapshot` + `InstallSnapshot`, boot-from-snapshot recovery, and LSM full-state enumeration (`Items`).
 - [x] **Phase 2.5b — membership changes**: add/remove a node at runtime via single-server config entries (adopt-on-append, learner catch-up, leader step-down on self-removal).
-- [ ] **Phase 3 — distributed layer**: a real **networked transport** (replace the in-memory one), **linearizable reads** (read-index / leader lease), then **sharding** (range or hash partitions) with per-shard Raft groups to scale horizontally.
+- [x] **Phase 3a — networked transport**: real TCP transport (`net/rpc`), a `quorum-server` process per node, and an HTTP client API — nodes run as separate processes.
+- [ ] **Phase 3b — linearizable reads**: read-index / leader lease so reads never return stale data.
+- [ ] **Phase 3c — sharding**: split the keyspace across per-shard Raft groups, with a **consistent-hashing (or range-partition) router** for key→shard placement and minimal reshuffling on membership change.
 - [ ] **Engine polish**: block compression, an ordered range/scan iterator, leveled compaction with correct tombstone lifetime.
 
 The name is the goal: a write is committed once a **quorum** of replicas has durably agreed on it.
